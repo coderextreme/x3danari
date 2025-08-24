@@ -7,4 +7,4 @@ The walking_man*.py was developed by Google AI Studio based on eric.py.
 x3d.py (X3DPSAIL) was created by Don Brutzman and Loren Peitso.
 
 I'm not sure of any copyright at this point, except for x3d.py.  You should use:
-``pip install x3d.py```
+``pip install x3d```, and if that fails, use x3d.py as a fallback.
