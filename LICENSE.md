@@ -2,7 +2,7 @@ interactive_x3d_renderer.py and skinned_x3d_renderer.py are developed by Google 
 
 The eric.py is developed by Aaron Bergstrom and transpiled from .x3d to .py by John Carlson.
 
-The walking_man*.py was developed by Google AI Studio based on eric.py.
+The walking_man*.py was developed by Google AI Studio based on eric5.py.
 
 x3d.py (X3DPSAIL) was created by Don Brutzman and Loren Peitso.
 
