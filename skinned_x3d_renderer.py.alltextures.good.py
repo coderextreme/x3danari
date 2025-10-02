@@ -13,12 +13,7 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-# --- New imports for the menu system ---
-import tkinter as tk
-import importlib
-import sys
-
-def unroll_indexed_face_set(positions, texcoords, pos_indices_str, tex_indices_str):
+def unroll_indexed_face_set(positions, texcoords, pos_indices_str, tex_indices_str, shape_name, log_info, all_images_for_logging={}):
     if not pos_indices_str: return None, None, None, None
     use_tex_indices = tex_indices_str is not None and len(tex_indices_str) > 0
     final_positions, final_texcoords, original_indices_map = [], [], []
@@ -40,17 +35,39 @@ def unroll_indexed_face_set(positions, texcoords, pos_indices_str, tex_indices_s
             else: current_tex_poly.append(idx)
         if len(current_tex_poly) >= 3: tex_polygons.append(current_tex_poly)
     if len(pos_polygons) != len(tex_polygons): tex_polygons = pos_polygons
-    vertex_count = 0
-    for pos_poly, tex_poly in zip(pos_polygons, tex_polygons):
+    vertex_count, total_triangles = 0, 0
+    for poly_idx, (pos_poly, tex_poly) in enumerate(zip(pos_polygons, tex_polygons)):
         for i in range(1, len(pos_poly) - 1):
+            total_triangles += 1
             triangle_pos_indices = [pos_poly[0], pos_poly[i], pos_poly[i+1]]
             triangle_tex_indices = [tex_poly[0], tex_poly[i], tex_poly[i+1]]
+            if log_info.get(shape_name, 0) < 3:
+                log_info[shape_name] = log_info.get(shape_name, 0) + 1
+                if log_info[shape_name] == 1:
+                    print(f"  - Detailed trace for first 3 triangles of '{shape_name}':")
+                print(f"  - Triangle {log_info[shape_name]}:")
+                fallback_msg = "(fallback to coordIndex)" if not use_tex_indices else ""
+                for v_num in range(3):
+                    c_idx, t_idx = triangle_pos_indices[v_num], triangle_tex_indices[v_num]
+                    pos_val = positions[c_idx]
+                    uv_val_str = "N/A"
+                    if texcoords is not None and t_idx < len(texcoords):
+                        uv_val = texcoords[t_idx]
+                        uv_val_str = f"[{uv_val[0]:.4f} {uv_val[1]:.4f}]"
+                        sampled_colors_str = ""
+                        for map_type, img in all_images_for_logging.items():
+                            w, h = img.size
+                            px, py = int((uv_val[0] % 1.0) * (w - 1)), int((1.0 - (uv_val[1] % 1.0)) * (h - 1))
+                            pixel_color = img.getpixel((px, py))
+                            sampled_colors_str += f" | sampler_color({map_type}): {pixel_color}"
+                    print(f"    - V{v_num+1}: coordIdx[{c_idx}]->pos{pos_val} | texCoordIdx[{t_idx}]{fallback_msg}->uv{uv_val_str}{sampled_colors_str}")
             for v_idx, t_idx in zip(triangle_pos_indices, triangle_tex_indices):
                 final_positions.append(positions[v_idx])
                 original_indices_map.append(v_idx)
                 if texcoords is not None and t_idx < len(texcoords):
                     final_texcoords.append(texcoords[t_idx])
             vertex_count += 3
+    print(f"  - Unrolled {len(pos_polygons)} polygons into {total_triangles} triangles for this shape.")
     final_indices = np.arange(vertex_count, dtype=np.uint32)
     return np.array(final_positions, dtype=np.float32), \
            np.array(final_texcoords, dtype=np.float32) if final_texcoords else None, \
@@ -93,6 +110,7 @@ class InteractiveAnariRenderer:
         self.start_time = time.time();
         self.device = anari.newDevice('default')
         if not self.device: raise RuntimeError("Could not create ANARI device.")
+        self.log_info = {}
         self._initialize_scene(); self._setup_display()
 
     def _initialize_scene(self):
@@ -165,9 +183,6 @@ class InteractiveAnariRenderer:
         root_joint_ref = humanoid_node.skeleton[0]
         self.hanim_humanoid.root_joint = self.def_map.get(getattr(root_joint_ref, 'USE', None), root_joint_ref)
         if not self.hanim_humanoid.root_joint: raise RuntimeError("Could not resolve the root HAnimJoint.")
-
-        # --- MODIFICATION TO FIX KEYERROR ---
-        # First, populate the joints dict from the HAnimHumanoid's 'joints' field
         for joint_ref in getattr(humanoid_node, 'joints', []):
             joint_node = self.def_map.get(getattr(joint_ref, 'USE', None), joint_ref)
             if not joint_node or not hasattr(joint_node, 'DEF'): continue
@@ -175,24 +190,6 @@ class InteractiveAnariRenderer:
             if name not in self.hanim_humanoid.joints:
                 rot = getattr(joint_node, 'rotation', (0, 1, 0, 0))
                 self.hanim_humanoid.joints[name] = {'node': joint_node, 'parent': None, 'children': [], 'initial_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'current_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'bind_pose_matrix': np.identity(4, dtype=np.float32), 'inv_bind_pose_matrix': np.identity(4, dtype=np.float32)}
-
-        # DEFENSIVE CHECK: Some X3D files define the root in 'skeleton' but omit it from the 'joints' list.
-        # This patch ensures it's always included in the dictionary before processing.
-        root_joint_node = self.hanim_humanoid.root_joint
-        if hasattr(root_joint_node, 'DEF') and root_joint_node.DEF:
-            root_name = root_joint_node.DEF
-            if root_name not in self.hanim_humanoid.joints:
-                print(f"INFO: Root joint '{root_name}' was not in the HAnimHumanoid's joint list. Adding it defensively.")
-                rot = getattr(root_joint_node, 'rotation', (0, 1, 0, 0))
-                self.hanim_humanoid.joints[root_name] = {
-                    'node': root_joint_node, 'parent': None, 'children': [],
-                    'initial_rotation': quat_from_axis_angle(rot[:3], rot[3]),
-                    'current_rotation': quat_from_axis_angle(rot[:3], rot[3]),
-                    'bind_pose_matrix': np.identity(4, dtype=np.float32),
-                    'inv_bind_pose_matrix': np.identity(4, dtype=np.float32)
-                }
-        # --- END MODIFICATION ---
-
         for name, joint_info in self.hanim_humanoid.joints.items():
             for child_ref in joint_info['node'].children:
                 if not child_ref: continue
@@ -202,7 +199,6 @@ class InteractiveAnariRenderer:
                     joint_info['children'].append(child_name)
                     self.hanim_humanoid.joints[child_name]['parent'] = name
         self.hanim_humanoid.joint_name_to_index = {name: i for i, name in enumerate(self.hanim_humanoid.joints.keys())}
-
 
     def _calculate_bind_poses(self, joint_name, parent_bind_matrix):
         joint_info = self.hanim_humanoid.joints[joint_name]; parent_name = joint_info['parent']
@@ -222,26 +218,20 @@ class InteractiveAnariRenderer:
         i_array = self.device.newArray1D(anari.UINT32_VEC3, indices)
         geom.setParameter("primitive.index", anari.ARRAY, i_array)
         geom.commitParameters()
-        material = self.device.newMaterial("matte")
+        material = self.device.newMaterial("physicallyBased")
         if 'color' in samplers:
-            material.setParameter("color", anari.SAMPLER, samplers['color'])
-            # material.setParameter("color", anari.STRING, "attribute0")
+            material.setParameter("map.baseColor", anari.SAMPLER, samplers['color'])
+            material.setParameter("baseColor", anari.STRING, "attribute0")
         else:
-            material.setParameter('color', anari.FLOAT32_VEC3, material_props['diffuse'])
-#        material = self.device.newMaterial("physicallyBased")
-#        if 'color' in samplers:
-#            material.setParameter("map.baseColor", anari.SAMPLER, samplers['color'])
-#            material.setParameter("baseColor", anari.STRING, "attribute0")
-#        else:
-#            material.setParameter('baseColor', anari.FLOAT32_VEC3, material_props['diffuse'])
-#        material.setParameter('metallic', anari.FLOAT32, material_props['metallic'])
-#        material.setParameter('roughness', anari.FLOAT32, material_props['roughness'])
-#        if 'normal' in samplers:
-#            material.setParameter("map.normal", anari.SAMPLER, samplers['normal'])
-#        if 'occlusion' in samplers:
-#            material.setParameter("map.occlusion", anari.SAMPLER, samplers['occlusion'])
-#        if 'metallicRoughness' in samplers:
-#            material.setParameter("map.metallicRoughness", anari.SAMPLER, samplers['metallicRoughness'])
+            material.setParameter('baseColor', anari.FLOAT32_VEC3, material_props['diffuse'])
+        material.setParameter('metallic', anari.FLOAT32, material_props['metallic'])
+        material.setParameter('roughness', anari.FLOAT32, material_props['roughness'])
+        if 'normal' in samplers:
+            material.setParameter("map.normal", anari.SAMPLER, samplers['normal'])
+        if 'occlusion' in samplers:
+            material.setParameter("map.occlusion", anari.SAMPLER, samplers['occlusion'])
+        if 'metallicRoughness' in samplers:
+            material.setParameter("map.metallicRoughness", anari.SAMPLER, samplers['metallicRoughness'])
         material.commitParameters()
         surface = self.device.newSurface()
         surface.setParameter('geometry', anari.GEOMETRY, geom)
@@ -251,19 +241,29 @@ class InteractiveAnariRenderer:
         return geom, v_array
 
     def _create_anari_sampler_from_texture_node(self, tex_node_ref):
-        if not tex_node_ref: return None
+        if not tex_node_ref: return None, None
         tex_node = self.def_map.get(getattr(tex_node_ref, 'USE', None), tex_node_ref)
         img = None
+        tex_def_name = getattr(tex_node, 'DEF', 'Unnamed ImageTexture')
         if getattr(tex_node, 'url', None) and tex_node.url:
             texture_url = tex_node.url[0]
+            print(f"      - Attempting to load ImageTexture '{tex_def_name}' from url: {texture_url[:60]}...")
             try:
                 if texture_url.startswith('data:image'):
                     header, encoded_data = texture_url.split(',', 1)
                     img = Image.open(io.BytesIO(base64.b64decode(encoded_data))).convert('RGB')
                 elif os.path.exists(texture_url):
                     img = Image.open(texture_url).convert('RGB')
-            except Exception:
-                return None
+                if img:
+                    print(f"        ... SUCCESS: Loaded image of size {img.size}")
+                else:
+                    print(f"        ... FAILED: URL is not a data URI or local file.")
+            except Exception as e:
+                print(f"        ... FAILED: Could not decode or open image. Error: {e}")
+                return None, None
+        else:
+            print(f"      - SKIPPING ImageTexture '{tex_def_name}': No URL provided.")
+            return None, None
         if img:
             img_data = (np.array(img) / 255.0).astype(np.float32)
             img_array = self.device.newArray2D(anari.FLOAT32_VEC3, img_data)
@@ -272,8 +272,8 @@ class InteractiveAnariRenderer:
             sampler.setParameter("inAttribute", anari.STRING, "attribute0")
             sampler.setParameter("wrapMode", anari.STRING, "repeat")
             sampler.commitParameters()
-            return sampler
-        return None
+            return sampler, img
+        return None, None
 
     def _setup_hanim_skinned(self, humanoid_node):
         self._build_skeleton_map(humanoid_node)
@@ -283,18 +283,23 @@ class InteractiveAnariRenderer:
         all_vertices_master = np.array(coord_node.point, dtype=np.float32).reshape(-1, 3)
         self.hanim_humanoid.base_vertices = all_vertices_master
         skinned_shapes = [n for n in self.def_map.values() if isinstance(n, x3d.Shape) and hasattr(n.geometry, 'coord') and hasattr(n.geometry.coord, 'USE') and n.geometry.coord.USE == coord_node.DEF]
+        print("\n--- Processing Shapes and Materials ---")
         for node in skinned_shapes:
+            shape_def = getattr(node, 'DEF', 'Unnamed Shape')
+            print(f"\nProcessing Shape: {shape_def}")
             appearance_node = self.def_map.get(getattr(node.appearance, 'USE', None), node.appearance)
             material_props = {'diffuse': (0.8, 0.8, 0.8), 'metallic': 0.1, 'roughness': 0.8}
-            target_uv_node, samplers = None, {}
+            target_uv_node, samplers, images_for_logging = None, {}, {}
             if appearance_node:
                 mat_node = None
                 if hasattr(appearance_node, 'material') and appearance_node.material:
                     mat_node = self.def_map.get(getattr(appearance_node.material, 'USE', None), appearance_node.material)
                 if mat_node:
+                    mat_def = getattr(mat_node, 'DEF', 'Unnamed Material')
                     material_props['diffuse'] = getattr(mat_node, 'diffuseColor', (0.8, 0.8, 0.8))
                     shininess = getattr(mat_node, 'shininess', 0.2)
                     material_props['roughness'] = np.clip(1.0 - shininess, 0.05, 1.0)
+                    print(f"  - Found Material: {mat_def} | baseColor: {material_props['diffuse']} | shininess: {shininess} -> roughness: {material_props['roughness']:.3f}")
                     texture_map = {
                         'color': getattr(mat_node, 'diffuseTexture', None) or getattr(mat_node, 'baseTexture', None),
                         'normal': getattr(mat_node, 'normalTexture', None),
@@ -303,15 +308,19 @@ class InteractiveAnariRenderer:
                     }
                     for map_type, tex_node in texture_map.items():
                         if tex_node:
-                            sampler = self._create_anari_sampler_from_texture_node(tex_node)
+                            sampler, img = self._create_anari_sampler_from_texture_node(tex_node)
                             if sampler:
                                 samplers[map_type] = sampler
+                                images_for_logging[map_type] = img
                 geo_tex_coord = getattr(node.geometry, 'texCoord', None)
                 if geo_tex_coord:
+                    uv_def = getattr(geo_tex_coord, 'DEF', '...')
                     if isinstance(geo_tex_coord, x3d.MultiTextureCoordinate) and geo_tex_coord.texCoord:
                         target_uv_node = geo_tex_coord.texCoord[0]
+                        uv_def = getattr(target_uv_node, 'DEF', '... (from MultiTexture)')
                     else:
                         target_uv_node = geo_tex_coord
+                    print(f"  - Using TextureCoordinate Node: {uv_def}")
             part_texcoords_master = None
             if target_uv_node:
                 data_node = self.def_map.get(getattr(target_uv_node, 'USE', None), target_uv_node)
@@ -319,10 +328,13 @@ class InteractiveAnariRenderer:
                     part_texcoords_master = np.array(data_node.point, dtype=np.float32).reshape(-1, 2)
             final_pos, final_uvs, final_indices, original_indices_map = unroll_indexed_face_set(
                 all_vertices_master, part_texcoords_master, node.geometry.coordIndex,
-                getattr(node.geometry, 'texCoordIndex', None)
+                getattr(node.geometry, 'texCoordIndex', None), shape_def, self.log_info, images_for_logging
             )
             if final_pos is None: continue
             self.hanim_humanoid.unrolled_to_original_indices.append(original_indices_map)
+            samplers = {k: v for k, v in samplers.items() if v is not None}
+            if not samplers: print("  - Final decision: Untextured surface.")
+            else: print(f"  - Final decision: Textured surface with maps: {list(samplers.keys())}")
             geom, v_array = self._create_anari_surface(final_pos, final_uvs, final_indices, samplers, material_props)
             self.hanim_humanoid.anari_geometries.append(geom)
             self.hanim_humanoid.anari_vertex_arrays.append(v_array)
@@ -336,9 +348,9 @@ class InteractiveAnariRenderer:
                     if v_idx < len(all_vertices_master):
                         self.hanim_humanoid.skin_indices[v_idx].append(joint_idx); self.hanim_humanoid.skin_weights[v_idx].append(weight)
 
-    def _animate_scene(self, t, root_rotation_angle=0.0):
+    def _animate_scene(self, t):
         if not self.hanim_humanoid or self.hanim_humanoid.base_vertices is None: return
-        self._animate_scene_skinned(t, root_rotation_angle)
+        self._animate_scene_skinned(t)
 
     def _update_joint_rotations(self, t):
         timer = next(iter(self.time_sensors.values()), None)
@@ -354,7 +366,7 @@ class InteractiveAnariRenderer:
                     final_rotation = self._multiply_quaternions(joint_info['initial_rotation'], animation_rotation)
                     joint_info['current_rotation'] = final_rotation
 
-    def _animate_scene_skinned(self, t, root_rotation_angle=0.0):
+    def _animate_scene_skinned(self, t):
         self._update_joint_rotations(t)
         def update_skinning_matrices(joint_name, parent_world_matrix):
             joint_info = self.hanim_humanoid.joints[joint_name]
@@ -366,11 +378,9 @@ class InteractiveAnariRenderer:
             joint_idx = self.hanim_humanoid.joint_name_to_index[joint_name]
             self.hanim_humanoid.joint_matrices[joint_idx] = world_matrix @ joint_info['inv_bind_pose_matrix']
             for child_name in joint_info['children']: update_skinning_matrices(child_name, world_matrix)
-
-        root_rotation_q = quat_from_axis_angle((0, 1, 0), root_rotation_angle)
-        root_transform = get_matrix_from_quat(root_rotation_q)
-        update_skinning_matrices(self.hanim_humanoid.root_joint.DEF, root_transform)
-
+        angle = t * 0.5; c, s = np.cos(angle), np.sin(angle)
+        rotation_matrix = np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]], dtype=np.float32)
+        update_skinning_matrices(self.hanim_humanoid.root_joint.DEF, rotation_matrix)
         base_verts_h = np.hstack((self.hanim_humanoid.base_vertices, np.ones((len(self.hanim_humanoid.base_vertices), 1), dtype=np.float32)))
         deformed_master_vertices = np.zeros_like(self.hanim_humanoid.base_vertices)
         for i in range(len(deformed_master_vertices)):
@@ -415,11 +425,7 @@ class InteractiveAnariRenderer:
         self.fig, self.ax = plt.subplots(figsize=(self.width/100, self.height/100), facecolor=fig_bg_color)
         self.ax.set_facecolor(fig_bg_color)
         self.image_display=self.ax.imshow(np.zeros((self.height,self.width,4),dtype=np.uint8))
-        self.ax.set_title("Performing character intro..."); plt.gca().invert_yaxis(); plt.axis('off'); self.fig.tight_layout(pad=0)
-
-        self.intro_duration = 4.0
-        self.intro_animation_active = True
-        self.character_animation_start_time = 0
+        self.ax.set_title("Drag to orbit, Scroll to zoom"); plt.gca().invert_yaxis(); plt.axis('off'); self.fig.tight_layout(pad=0)
 
     def run(self):
         self._setup_interaction_handlers()
@@ -427,27 +433,8 @@ class InteractiveAnariRenderer:
         plt.show()
 
     def _update_frame(self, frame_num):
-        current_time = time.time()
-        time_since_app_start = current_time - self.start_time
-
-        character_anim_time = 0
-        root_rotation_angle = 0.0
-
-        if self.intro_animation_active:
-            if time_since_app_start < self.intro_duration:
-                progress = time_since_app_start / self.intro_duration
-                root_rotation_angle = progress * math.pi
-            else:
-                self.intro_animation_active = False
-                self.character_animation_start_time = current_time
-                root_rotation_angle = math.pi
-                self.ax.set_title("Drag to orbit, Scroll to zoom")
-        else:
-            root_rotation_angle = math.pi
-            character_anim_time = current_time - self.character_animation_start_time
-
-        self._animate_scene(character_anim_time, root_rotation_angle)
-
+        elapsed_time=time.time()-self.start_time
+        self._animate_scene(elapsed_time)
         self._update_camera()
         self.frame.render()
         color_data = self.frame.get('channel.color')
@@ -472,54 +459,16 @@ class InteractiveAnariRenderer:
         self.cam_state.radius=max(0.2,self.cam_state.radius*(0.9 if event.button=='up' else 1.1))
 
 if __name__ == "__main__":
-    selected_module_name = None
-    def launch_renderer(module_name):
-        global selected_module_name
-        selected_module_name = module_name
-        root.destroy()
-
-    root = tk.Tk()
-    root.title("Select X3D Scene")
-    window_width = 350
-    window_height = 250
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    center_x = int(screen_width/2 - window_width/2)
-    center_y = int(screen_height/2 - window_height/2)
-    root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
-    label = tk.Label(root, text="Please choose a scene to render:")
-    label.pack(pady=10)
-
-    scene_files = [
-        "JoeDemo5JoeSkin5a",
-        "JoeSkinTexcoordDisplacerKickUpdate2",
-        "conan_23_Aug2025",
-        "eric5",
-        "walking_man_cc_test"
-    ]
-
-    for name in scene_files:
-        button = tk.Button(root, text=name, command=lambda n=name: launch_renderer(n))
-        button.pack(pady=4, padx=20, fill='x')
-
-    root.mainloop()
-
-    if selected_module_name:
+    try:
+        from conan_23_Aug2025 import X3D0 as scene_to_render
+        print("Rendering scene from 'conan_23_Aug2025.py'...")
+    except ImportError:
+        print("Could not find 'conan_23_Aug2025.py', falling back to 'walking_man_cc_test.py'")
         try:
-            print(f"Loading scene from '{selected_module_name}.py'...")
-            scene_module = importlib.import_module(selected_module_name)
-            scene_to_render = scene_module.X3D0
-            renderer = InteractiveAnariRenderer(scene_to_render, width=1024, height=768)
-            renderer.run()
+            from walking_man_cc_test import X3D0 as scene_to_render
+            print("Rendering scene from 'walking_man_cc_test.py'...")
         except ImportError:
-            print(f"\n--- ERROR ---")
-            print(f"Could not import the scene '{selected_module_name}'.")
-            print(f"Please make sure the file '{selected_module_name}.py' exists in the same directory as the renderer.")
-            sys.exit(1)
-        except AttributeError:
-            print(f"\n--- ERROR ---")
-            print(f"The file '{selected_module_name}.py' was found, but it does not contain an object named 'X3D0'.")
-            print("Please ensure the scene object is correctly defined and named.")
-            sys.exit(1)
-    else:
-        print("No scene selected. Exiting.")
+            print("Error: No valid X3D scene file found.")
+            exit()
+    renderer = InteractiveAnariRenderer(scene_to_render, width=1024, height=768)
+    renderer.run()
