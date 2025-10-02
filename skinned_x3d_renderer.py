@@ -1,4 +1,4 @@
-# --- START OF FILE skinned_x3d_renderer.py (Final Version with Correct PBR Parameters) ---
+# --- START OF FILE skinned_x3d_renderer.py (Final Polished Version) ---
 
 import x3d
 import pynari as anari
@@ -24,6 +24,42 @@ def srgb_to_linear(srgb_array):
     return np.where(linear <= 0.04045,
                     linear / 12.92,
                     np.power((linear + 0.055) / 1.055, 2.4))
+
+# --- ROBUST TANGENT CALCULATION FUNCTION ---
+def calculate_tangents(positions, texcoords):
+    """Calculates tangent vectors, safely handling degenerate UV triangles."""
+    if texcoords is None or len(texcoords) == 0:
+        return None
+
+    tangents = np.zeros_like(positions)
+
+    for i in range(0, len(positions), 3):
+        p0, p1, p2 = positions[i:i+3]
+        uv0, uv1, uv2 = texcoords[i:i+3]
+
+        edge1 = p1 - p0
+        edge2 = p2 - p0
+        deltaUV1 = uv1 - uv0
+        deltaUV2 = uv2 - uv0
+
+        tangent = np.zeros(3, dtype=np.float32)
+
+        denominator = deltaUV1[0] * deltaUV2[1] - deltaUV2[0] * deltaUV1[1]
+        if abs(denominator) > 1e-6:
+            f = 1.0 / denominator
+            tangent[0] = f * (deltaUV2[1] * edge1[0] - deltaUV1[1] * edge2[0])
+            tangent[1] = f * (deltaUV2[1] * edge1[1] - deltaUV1[1] * edge2[1])
+            tangent[2] = f * (deltaUV2[1] * edge1[2] - deltaUV1[1] * edge2[2])
+
+        norm = np.linalg.norm(tangent)
+        if norm > 1e-6:
+            tangent /= norm
+
+        tangents[i] = tangent
+        tangents[i+1] = tangent
+        tangents[i+2] = tangent
+
+    return tangents
 
 def unroll_indexed_face_set(positions, texcoords, pos_indices_str, tex_indices_str):
     if not pos_indices_str: return None, None, None, None
@@ -126,17 +162,31 @@ class InteractiveAnariRenderer:
                 self._setup_hanim_skinned(humanoid_node)
             if self.surfaces: self.world.setParameterArray1D('surface', anari.SURFACE, self.surfaces)
 
+        # --- ARTISTIC THREE-POINT LIGHTING SETUP ---
+
+        # 1. Key Light (main light, warm color)
         key_light = self.device.newLight("directional")
         key_light.setParameter('direction', anari.FLOAT32_VEC3, (0.5, -0.8, -0.6))
-        key_light.setParameter('irradiance', anari.FLOAT32, 3.0)
+        key_light.setParameter('color', anari.FLOAT32_VEC3, (1.0, 0.9, 0.7)) # Warm color
+        key_light.setParameter('irradiance', anari.FLOAT32, 3.5)
         key_light.commitParameters()
         self.lights.append(key_light)
 
+        # 2. Fill Light (softens shadows, cool color)
         fill_light = self.device.newLight("directional")
         fill_light.setParameter('direction', anari.FLOAT32_VEC3, (-0.3, -0.2, 0.4))
+        fill_light.setParameter('color', anari.FLOAT32_VEC3, (0.7, 0.8, 1.0)) # Cool color
         fill_light.setParameter('irradiance', anari.FLOAT32, 1.0)
         fill_light.commitParameters()
         self.lights.append(fill_light)
+
+        # 3. Rim Light (separates from background)
+        rim_light = self.device.newLight("directional")
+        rim_light.setParameter('direction', anari.FLOAT32_VEC3, (-0.4, 0.5, 0.8)) # From back-left
+        rim_light.setParameter('color', anari.FLOAT32_VEC3, (1.0, 1.0, 1.0))
+        rim_light.setParameter('irradiance', anari.FLOAT32, 2.0)
+        rim_light.commitParameters()
+        self.lights.append(rim_light)
 
         if self.lights: self.world.setParameterArray1D('light', anari.LIGHT, self.lights)
         self.world.commitParameters()
@@ -209,20 +259,24 @@ class InteractiveAnariRenderer:
         joint_info['bind_pose_matrix'], joint_info['inv_bind_pose_matrix'] = bind_matrix, np.linalg.inv(bind_matrix)
         for child_name in joint_info['children']: self._calculate_bind_poses(child_name, bind_matrix)
 
-    def _create_anari_surface(self, positions, texcoords, indices, samplers, material_props):
+    def _create_anari_surface(self, positions, texcoords, tangents, indices, samplers, material_props):
         geom = self.device.newGeometry("triangle")
         v_array = self.device.newArray1D(anari.FLOAT32_VEC3, positions)
         geom.setParameter("vertex.position", anari.ARRAY, v_array)
         if texcoords is not None and len(texcoords) > 0:
             t_array = self.device.newArray1D(anari.FLOAT32_VEC2, texcoords)
             geom.setParameter("vertex.attribute0", anari.ARRAY, t_array)
+
+        if tangents is not None and len(tangents) > 0:
+            tan_array = self.device.newArray1D(anari.FLOAT32_VEC3, tangents)
+            geom.setParameter("vertex.tangent", anari.ARRAY, tan_array)
+
         i_array = self.device.newArray1D(anari.UINT32_VEC3, indices)
         geom.setParameter("primitive.index", anari.ARRAY, i_array)
         geom.commitParameters()
 
         material = self.device.newMaterial("physicallyBased")
 
-        # --- THE FINAL FIX: Use the correct parameter names for PBR maps ---
         if 'color' in samplers:
             material.setParameter("baseColor", anari.SAMPLER, samplers['color'])
         else:
@@ -235,8 +289,6 @@ class InteractiveAnariRenderer:
             material.setParameter("normal", anari.SAMPLER, samplers['normal'])
         if 'occlusion' in samplers:
             material.setParameter("occlusion", anari.SAMPLER, samplers['occlusion'])
-        if 'metallicRoughness' in samplers:
-            material.setParameter("metallicRoughness", anari.SAMPLER, samplers['metallicRoughness'])
 
         material.commitParameters()
         surface = self.device.newSurface()
@@ -246,7 +298,7 @@ class InteractiveAnariRenderer:
         self.surfaces.append(surface)
         return geom, v_array
 
-    def _create_anari_sampler_from_texture_node(self, tex_node_ref):
+    def _create_anari_sampler_from_texture_node(self, tex_node_ref, map_type="color"):
         if not tex_node_ref: return None
         tex_node = self.def_map.get(getattr(tex_node_ref, 'USE', None), tex_node_ref)
         img = None
@@ -265,14 +317,17 @@ class InteractiveAnariRenderer:
                     print(f"Warning: Could not load texture from '{texture_url}'. Reason: {e}")
                     continue
         if img:
-            img_data_srgb = np.array(img, dtype=np.float32) / 255.0
-            rgb = img_data_srgb[:, :, :3]
-            alpha = img_data_srgb[:, :, 3:4]
-            rgb_linear = srgb_to_linear(rgb)
-            img_data_linear = np.concatenate([rgb_linear, alpha], axis=2)
-            img_array = self.device.newArray2D(anari.FLOAT32_VEC4, img_data_linear)
+            img_data_normalized = np.array(img, dtype=np.float32) / 255.0
 
-            # This array does NOT get committed here. It's used by the sampler which is committed.
+            if map_type == 'color':
+                rgb = img_data_normalized[:, :, :3]
+                alpha = img_data_normalized[:, :, 3:4]
+                rgb_linear = srgb_to_linear(rgb)
+                final_data = np.concatenate([rgb_linear, alpha], axis=2)
+            else:
+                final_data = img_data_normalized
+
+            img_array = self.device.newArray2D(anari.FLOAT32_VEC4, final_data)
 
             sampler = self.device.newSampler("image2D")
             sampler.setParameter("image", anari.ARRAY, img_array)
@@ -280,10 +335,8 @@ class InteractiveAnariRenderer:
             sampler.setParameter("wrapMode", anari.STRING, "repeat")
             sampler.commitParameters()
 
-            print(f"DEBUG: Successfully created sampler from linear float data for '{getattr(tex_node, 'DEF', 'N/A')}'.")
             return sampler
 
-        print(f"DEBUG: FAILED to create sampler for texture node: {getattr(tex_node_ref, 'DEF', 'N/A')}")
         return None
 
     def _setup_hanim_skinned(self, humanoid_node):
@@ -313,8 +366,8 @@ class InteractiveAnariRenderer:
                         'metallicRoughness': getattr(mat_node, 'specularTexture', None)
                     }
                     for map_type, tex_node in texture_map.items():
-                        if tex_node:
-                            sampler = self._create_anari_sampler_from_texture_node(tex_node)
+                        if tex_node and map_type != 'metallicRoughness':
+                            sampler = self._create_anari_sampler_from_texture_node(tex_node, map_type)
                             if sampler:
                                 samplers[map_type] = sampler
                 geo_tex_coord = getattr(node.geometry, 'texCoord', None)
@@ -333,8 +386,11 @@ class InteractiveAnariRenderer:
                 getattr(node.geometry, 'texCoordIndex', None)
             )
             if final_pos is None: continue
+
+            final_tangents = calculate_tangents(final_pos, final_uvs)
+
             self.hanim_humanoid.unrolled_to_original_indices.append(original_indices_map)
-            geom, v_array = self._create_anari_surface(final_pos, final_uvs, final_indices, samplers, material_props)
+            geom, v_array = self._create_anari_surface(final_pos, final_uvs, final_tangents, final_indices, samplers, material_props)
             self.hanim_humanoid.anari_geometries.append(geom)
             self.hanim_humanoid.anari_vertex_arrays.append(v_array)
         self._calculate_bind_poses(self.hanim_humanoid.root_joint.DEF, np.identity(4, dtype=np.float32))
@@ -422,8 +478,9 @@ class InteractiveAnariRenderer:
         renderer=self.device.newRenderer("default")
         renderer.setParameter('backgroundColor', anari.FLOAT32_VEC4, (0.0, 0.0, 0.0, 1.0))
 
-        # Add a global ambient light term to the renderer.
-        renderer.setParameter('ambientRadiance', anari.FLOAT32, 0.3)
+        # Add a global ambient light and increase render quality
+        renderer.setParameter('ambientRadiance', anari.FLOAT32, 0.4)
+        renderer.setParameter("pixelSamples", anari.INT32, 4) # Anti-aliasing
 
         renderer.commitParameters()
         self.frame=self.device.newFrame(); self.frame.setParameter('size',anari.UINT32_VEC2,(self.width,self.height)); self.frame.setParameter('channel.color',anari.DATA_TYPE,anari.UFIXED8_RGBA_SRGB)
