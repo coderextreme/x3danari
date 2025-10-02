@@ -1,4 +1,4 @@
-# --- START OF FILE skinned_x3d_renderer.py ---
+# --- START OF FILE skinned_x3d_renderer.py (Final Version with Correct PBR Parameters) ---
 
 import x3d
 import pynari as anari
@@ -13,10 +13,17 @@ import io
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-# --- New imports for the menu system ---
 import tkinter as tk
 import importlib
 import sys
+
+# --- HELPER FUNCTION FOR MANUAL SRGB CONVERSION ---
+def srgb_to_linear(srgb_array):
+    """Converts a NumPy array from sRGB color space to linear color space."""
+    linear = np.array(srgb_array, dtype=np.float32)
+    return np.where(linear <= 0.04045,
+                    linear / 12.92,
+                    np.power((linear + 0.055) / 1.055, 2.4))
 
 def unroll_indexed_face_set(positions, texcoords, pos_indices_str, tex_indices_str):
     if not pos_indices_str: return None, None, None, None
@@ -118,14 +125,19 @@ class InteractiveAnariRenderer:
             if hasattr(humanoid_node, 'skinCoord') and hasattr(humanoid_node, 'skin'):
                 self._setup_hanim_skinned(humanoid_node)
             if self.surfaces: self.world.setParameterArray1D('surface', anari.SURFACE, self.surfaces)
+
         key_light = self.device.newLight("directional")
         key_light.setParameter('direction', anari.FLOAT32_VEC3, (0.5, -0.8, -0.6))
-        key_light.setParameter('irradiance', anari.FLOAT32, 4.0)
-        key_light.commitParameters(); self.lights.append(key_light)
+        key_light.setParameter('irradiance', anari.FLOAT32, 3.0)
+        key_light.commitParameters()
+        self.lights.append(key_light)
+
         fill_light = self.device.newLight("directional")
-        fill_light.setParameter('direction', anari.FLOAT32_VEC3, (-0.3, -0.2, -0.4))
-        fill_light.setParameter('irradiance', anari.FLOAT32, 1.5)
-        fill_light.commitParameters(); self.lights.append(fill_light)
+        fill_light.setParameter('direction', anari.FLOAT32_VEC3, (-0.3, -0.2, 0.4))
+        fill_light.setParameter('irradiance', anari.FLOAT32, 1.0)
+        fill_light.commitParameters()
+        self.lights.append(fill_light)
+
         if self.lights: self.world.setParameterArray1D('light', anari.LIGHT, self.lights)
         self.world.commitParameters()
 
@@ -165,9 +177,6 @@ class InteractiveAnariRenderer:
         root_joint_ref = humanoid_node.skeleton[0]
         self.hanim_humanoid.root_joint = self.def_map.get(getattr(root_joint_ref, 'USE', None), root_joint_ref)
         if not self.hanim_humanoid.root_joint: raise RuntimeError("Could not resolve the root HAnimJoint.")
-
-        # --- MODIFICATION TO FIX KEYERROR ---
-        # First, populate the joints dict from the HAnimHumanoid's 'joints' field
         for joint_ref in getattr(humanoid_node, 'joints', []):
             joint_node = self.def_map.get(getattr(joint_ref, 'USE', None), joint_ref)
             if not joint_node or not hasattr(joint_node, 'DEF'): continue
@@ -175,24 +184,13 @@ class InteractiveAnariRenderer:
             if name not in self.hanim_humanoid.joints:
                 rot = getattr(joint_node, 'rotation', (0, 1, 0, 0))
                 self.hanim_humanoid.joints[name] = {'node': joint_node, 'parent': None, 'children': [], 'initial_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'current_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'bind_pose_matrix': np.identity(4, dtype=np.float32), 'inv_bind_pose_matrix': np.identity(4, dtype=np.float32)}
-
-        # DEFENSIVE CHECK: Some X3D files define the root in 'skeleton' but omit it from the 'joints' list.
-        # This patch ensures it's always included in the dictionary before processing.
         root_joint_node = self.hanim_humanoid.root_joint
         if hasattr(root_joint_node, 'DEF') and root_joint_node.DEF:
             root_name = root_joint_node.DEF
             if root_name not in self.hanim_humanoid.joints:
                 print(f"INFO: Root joint '{root_name}' was not in the HAnimHumanoid's joint list. Adding it defensively.")
                 rot = getattr(root_joint_node, 'rotation', (0, 1, 0, 0))
-                self.hanim_humanoid.joints[root_name] = {
-                    'node': root_joint_node, 'parent': None, 'children': [],
-                    'initial_rotation': quat_from_axis_angle(rot[:3], rot[3]),
-                    'current_rotation': quat_from_axis_angle(rot[:3], rot[3]),
-                    'bind_pose_matrix': np.identity(4, dtype=np.float32),
-                    'inv_bind_pose_matrix': np.identity(4, dtype=np.float32)
-                }
-        # --- END MODIFICATION ---
-
+                self.hanim_humanoid.joints[root_name] = { 'node': root_joint_node, 'parent': None, 'children': [], 'initial_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'current_rotation': quat_from_axis_angle(rot[:3], rot[3]), 'bind_pose_matrix': np.identity(4, dtype=np.float32), 'inv_bind_pose_matrix': np.identity(4, dtype=np.float32)}
         for name, joint_info in self.hanim_humanoid.joints.items():
             for child_ref in joint_info['node'].children:
                 if not child_ref: continue
@@ -202,7 +200,6 @@ class InteractiveAnariRenderer:
                     joint_info['children'].append(child_name)
                     self.hanim_humanoid.joints[child_name]['parent'] = name
         self.hanim_humanoid.joint_name_to_index = {name: i for i, name in enumerate(self.hanim_humanoid.joints.keys())}
-
 
     def _calculate_bind_poses(self, joint_name, parent_bind_matrix):
         joint_info = self.hanim_humanoid.joints[joint_name]; parent_name = joint_info['parent']
@@ -222,26 +219,25 @@ class InteractiveAnariRenderer:
         i_array = self.device.newArray1D(anari.UINT32_VEC3, indices)
         geom.setParameter("primitive.index", anari.ARRAY, i_array)
         geom.commitParameters()
-        material = self.device.newMaterial("matte")
+
+        material = self.device.newMaterial("physicallyBased")
+
+        # --- THE FINAL FIX: Use the correct parameter names for PBR maps ---
         if 'color' in samplers:
-            material.setParameter("color", anari.SAMPLER, samplers['color'])
-            # material.setParameter("color", anari.STRING, "attribute0")
+            material.setParameter("baseColor", anari.SAMPLER, samplers['color'])
         else:
-            material.setParameter('color', anari.FLOAT32_VEC3, material_props['diffuse'])
-#        material = self.device.newMaterial("physicallyBased")
-#        if 'color' in samplers:
-#            material.setParameter("map.baseColor", anari.SAMPLER, samplers['color'])
-#            material.setParameter("baseColor", anari.STRING, "attribute0")
-#        else:
-#            material.setParameter('baseColor', anari.FLOAT32_VEC3, material_props['diffuse'])
-#        material.setParameter('metallic', anari.FLOAT32, material_props['metallic'])
-#        material.setParameter('roughness', anari.FLOAT32, material_props['roughness'])
-#        if 'normal' in samplers:
-#            material.setParameter("map.normal", anari.SAMPLER, samplers['normal'])
-#        if 'occlusion' in samplers:
-#            material.setParameter("map.occlusion", anari.SAMPLER, samplers['occlusion'])
-#        if 'metallicRoughness' in samplers:
-#            material.setParameter("map.metallicRoughness", anari.SAMPLER, samplers['metallicRoughness'])
+            material.setParameter('baseColor', anari.FLOAT32_VEC3, material_props['diffuse'])
+
+        material.setParameter('metallic', anari.FLOAT32, material_props['metallic'])
+        material.setParameter('roughness', anari.FLOAT32, material_props['roughness'])
+
+        if 'normal' in samplers:
+            material.setParameter("normal", anari.SAMPLER, samplers['normal'])
+        if 'occlusion' in samplers:
+            material.setParameter("occlusion", anari.SAMPLER, samplers['occlusion'])
+        if 'metallicRoughness' in samplers:
+            material.setParameter("metallicRoughness", anari.SAMPLER, samplers['metallicRoughness'])
+
         material.commitParameters()
         surface = self.device.newSurface()
         surface.setParameter('geometry', anari.GEOMETRY, geom)
@@ -255,24 +251,39 @@ class InteractiveAnariRenderer:
         tex_node = self.def_map.get(getattr(tex_node_ref, 'USE', None), tex_node_ref)
         img = None
         if getattr(tex_node, 'url', None) and tex_node.url:
-            texture_url = tex_node.url[0]
-            try:
-                if texture_url.startswith('data:image'):
-                    header, encoded_data = texture_url.split(',', 1)
-                    img = Image.open(io.BytesIO(base64.b64decode(encoded_data))).convert('RGB')
-                elif os.path.exists(texture_url):
-                    img = Image.open(texture_url).convert('RGB')
-            except Exception:
-                return None
+            for texture_url in tex_node.url:
+                try:
+                    if texture_url.startswith('data:image'):
+                        header, encoded_data = texture_url.split(',', 1)
+                        img_bytes = base64.b64decode(encoded_data)
+                        img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+                        if img: break
+                    elif os.path.exists(texture_url):
+                        img = Image.open(texture_url).convert('RGBA')
+                        if img: break
+                except Exception as e:
+                    print(f"Warning: Could not load texture from '{texture_url}'. Reason: {e}")
+                    continue
         if img:
-            img_data = (np.array(img) / 255.0).astype(np.float32)
-            img_array = self.device.newArray2D(anari.FLOAT32_VEC3, img_data)
+            img_data_srgb = np.array(img, dtype=np.float32) / 255.0
+            rgb = img_data_srgb[:, :, :3]
+            alpha = img_data_srgb[:, :, 3:4]
+            rgb_linear = srgb_to_linear(rgb)
+            img_data_linear = np.concatenate([rgb_linear, alpha], axis=2)
+            img_array = self.device.newArray2D(anari.FLOAT32_VEC4, img_data_linear)
+
+            # This array does NOT get committed here. It's used by the sampler which is committed.
+
             sampler = self.device.newSampler("image2D")
             sampler.setParameter("image", anari.ARRAY, img_array)
             sampler.setParameter("inAttribute", anari.STRING, "attribute0")
             sampler.setParameter("wrapMode", anari.STRING, "repeat")
             sampler.commitParameters()
+
+            print(f"DEBUG: Successfully created sampler from linear float data for '{getattr(tex_node, 'DEF', 'N/A')}'.")
             return sampler
+
+        print(f"DEBUG: FAILED to create sampler for texture node: {getattr(tex_node_ref, 'DEF', 'N/A')}")
         return None
 
     def _setup_hanim_skinned(self, humanoid_node):
@@ -408,7 +419,13 @@ class InteractiveAnariRenderer:
     def _setup_display(self):
         self.cam_state=CameraState(self.initial_camera_pos, self.initial_camera_at)
         self.camera=self.device.newCamera("perspective"); self.camera.setParameter('aspect',anari.FLOAT32,self.width/self.height); self.camera.setParameter('fovy',anari.FLOAT32,math.radians(60.0))
-        renderer=self.device.newRenderer("default"); renderer.setParameter('backgroundColor', anari.FLOAT32_VEC4, (0.0, 0.0, 0.0, 1.0)); renderer.commitParameters()
+        renderer=self.device.newRenderer("default")
+        renderer.setParameter('backgroundColor', anari.FLOAT32_VEC4, (0.0, 0.0, 0.0, 1.0))
+
+        # Add a global ambient light term to the renderer.
+        renderer.setParameter('ambientRadiance', anari.FLOAT32, 0.3)
+
+        renderer.commitParameters()
         self.frame=self.device.newFrame(); self.frame.setParameter('size',anari.UINT32_VEC2,(self.width,self.height)); self.frame.setParameter('channel.color',anari.DATA_TYPE,anari.UFIXED8_RGBA_SRGB)
         self.frame.setParameter('world',anari.WORLD,self.world); self.frame.setParameter('camera',anari.CAMERA,self.camera); self.frame.setParameter('renderer',anari.RENDERER,renderer); self.frame.commitParameters()
         fig_bg_color = (0.0, 0.0, 0.0)
@@ -416,7 +433,6 @@ class InteractiveAnariRenderer:
         self.ax.set_facecolor(fig_bg_color)
         self.image_display=self.ax.imshow(np.zeros((self.height,self.width,4),dtype=np.uint8))
         self.ax.set_title("Performing character intro..."); plt.gca().invert_yaxis(); plt.axis('off'); self.fig.tight_layout(pad=0)
-
         self.intro_duration = 4.0
         self.intro_animation_active = True
         self.character_animation_start_time = 0
@@ -429,10 +445,8 @@ class InteractiveAnariRenderer:
     def _update_frame(self, frame_num):
         current_time = time.time()
         time_since_app_start = current_time - self.start_time
-
         character_anim_time = 0
         root_rotation_angle = 0.0
-
         if self.intro_animation_active:
             if time_since_app_start < self.intro_duration:
                 progress = time_since_app_start / self.intro_duration
@@ -445,13 +459,12 @@ class InteractiveAnariRenderer:
         else:
             root_rotation_angle = math.pi
             character_anim_time = current_time - self.character_animation_start_time
-
         self._animate_scene(character_anim_time, root_rotation_angle)
-
         self._update_camera()
         self.frame.render()
         color_data = self.frame.get('channel.color')
-        self.image_display.set_data(color_data)
+        if color_data is not None and not isinstance(color_data, int):
+             self.image_display.set_data(color_data)
         return [self.image_display]
 
     def _update_camera(self):
